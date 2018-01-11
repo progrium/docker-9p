@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -10,38 +11,35 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
-const socketAddress = "/run/docker/plugins/9p.sock"
-
-type volume struct {
-	Host     string
-	Port     string
+type Volume struct {
+	Host string
+	Port string
 
 	Mountpoint  string
 	connections int
 }
 
-type driver struct {
+type Driver struct {
 	sync.RWMutex
 
 	root      string
 	statePath string
-	volumes   map[string]*volume
+	volumes   map[string]*Volume
 }
 
-func newDriver(root string) (*driver, error) {
+func newDriver(root string) (*Driver, error) {
 	logrus.WithField("method", "new driver").Debug(root)
 
-	d := &driver{
+	d := &Driver{
 		root:      filepath.Join(root, "volumes"),
 		statePath: filepath.Join(root, "state", "9p-state.json"),
-		volumes:   map[string]*volume{},
+		volumes:   map[string]*Volume{},
 	}
 
 	data, err := ioutil.ReadFile(d.statePath)
@@ -60,7 +58,7 @@ func newDriver(root string) (*driver, error) {
 	return d, nil
 }
 
-func (d *driver) saveState() {
+func (d *Driver) saveState() {
 	data, err := json.Marshal(d.volumes)
 	if err != nil {
 		logrus.WithField("statePath", d.statePath).Error(err)
@@ -72,12 +70,12 @@ func (d *driver) saveState() {
 	}
 }
 
-func (d *driver) Create(r volume.Request) volume.Response {
+func (d *Driver) Create(r *volume.CreateRequest) error {
 	logrus.WithField("method", "create").Debugf("%#v", r)
 
 	d.Lock()
 	defer d.Unlock()
-	v := &volume{}
+	v := &Volume{}
 
 	for key, val := range r.Options {
 		switch key {
@@ -99,10 +97,10 @@ func (d *driver) Create(r volume.Request) volume.Response {
 
 	d.saveState()
 
-	return volume.Response{}
+	return nil
 }
 
-func (d *driver) Remove(r volume.Request) volume.Response {
+func (d *Driver) Remove(r *volume.RemoveRequest) error {
 	logrus.WithField("method", "remove").Debugf("%#v", r)
 
 	d.Lock()
@@ -121,10 +119,10 @@ func (d *driver) Remove(r volume.Request) volume.Response {
 	}
 	delete(d.volumes, r.Name)
 	d.saveState()
-	return volume.Response{}
+	return nil
 }
 
-func (d *driver) Path(r volume.Request) volume.Response {
+func (d *Driver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 	logrus.WithField("method", "path").Debugf("%#v", r)
 
 	d.RLock()
@@ -132,13 +130,13 @@ func (d *driver) Path(r volume.Request) volume.Response {
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return responseError(fmt.Sprintf("volume %s not found", r.Name))
+		return nil, responseError(fmt.Sprintf("volume %s not found", r.Name))
 	}
 
-	return volume.Response{Mountpoint: v.Mountpoint}
+	return &volume.PathResponse{Mountpoint: v.Mountpoint}, nil
 }
 
-func (d *driver) Mount(r volume.MountRequest) volume.Response {
+func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	logrus.WithField("method", "mount").Debugf("%#v", r)
 
 	d.Lock()
@@ -146,34 +144,34 @@ func (d *driver) Mount(r volume.MountRequest) volume.Response {
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return responseError(fmt.Sprintf("volume %s not found", r.Name))
+		return nil, responseError(fmt.Sprintf("volume %s not found", r.Name))
 	}
 
 	if v.connections == 0 {
 		fi, err := os.Lstat(v.Mountpoint)
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(v.Mountpoint, 0755); err != nil {
-				return responseError(err.Error())
+				return nil, responseError(err.Error())
 			}
 		} else if err != nil {
-			return responseError(err.Error())
+			return nil, responseError(err.Error())
 		}
 
 		if fi != nil && !fi.IsDir() {
-			return responseError(fmt.Sprintf("%v already exist and it's not a directory", v.Mountpoint))
+			return nil, responseError(fmt.Sprintf("%v already exist and it's not a directory", v.Mountpoint))
 		}
 
 		if err := d.mountVolume(v); err != nil {
-			return responseError(err.Error())
+			return nil, responseError(err.Error())
 		}
 	}
 
 	v.connections++
 
-	return volume.Response{Mountpoint: v.Mountpoint}
+	return &volume.MountResponse{Mountpoint: v.Mountpoint}, nil
 }
 
-func (d *driver) Unmount(r volume.UnmountRequest) volume.Response {
+func (d *Driver) Unmount(r *volume.UnmountRequest) error {
 	logrus.WithField("method", "unmount").Debugf("%#v", r)
 
 	d.Lock()
@@ -192,10 +190,10 @@ func (d *driver) Unmount(r volume.UnmountRequest) volume.Response {
 		v.connections = 0
 	}
 
-	return volume.Response{}
+	return nil
 }
 
-func (d *driver) Get(r volume.Request) volume.Response {
+func (d *Driver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 	logrus.WithField("method", "get").Debugf("%#v", r)
 
 	d.Lock()
@@ -203,14 +201,14 @@ func (d *driver) Get(r volume.Request) volume.Response {
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return responseError(fmt.Sprintf("volume %s not found", r.Name))
+		return nil, responseError(fmt.Sprintf("volume %s not found", r.Name))
 	}
 
-	return volume.Response{Volume: &volume.Volume{Name: r.Name, Mountpoint: v.Mountpoint}}
+	return &volume.GetResponse{Volume: &volume.Volume{Name: r.Name, Mountpoint: v.Mountpoint}}, nil
 }
 
-func (d *driver) List(r volume.Request) volume.Response {
-	logrus.WithField("method", "list").Debugf("%#v", r)
+func (d *Driver) List() (*volume.ListResponse, error) {
+	logrus.WithField("method", "list").Debugf("list")
 
 	d.Lock()
 	defer d.Unlock()
@@ -219,34 +217,34 @@ func (d *driver) List(r volume.Request) volume.Response {
 	for name, v := range d.volumes {
 		vols = append(vols, &volume.Volume{Name: name, Mountpoint: v.Mountpoint})
 	}
-	return volume.Response{Volumes: vols}
+	return &volume.ListResponse{Volumes: vols}, nil
 }
 
-func (d *driver) Capabilities(r volume.Request) volume.Response {
-	logrus.WithField("method", "capabilities").Debugf("%#v", r)
+func (d *Driver) Capabilities() *volume.CapabilitiesResponse {
+	logrus.WithField("method", "capabilities").Debugf("capabilities")
 
-	return volume.Response{Capabilities: volume.Capability{Scope: "local"}}
+	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "local"}}
 }
 
-func (d *driver) mountVolume(v *volume) error {
-  port := v.Port
-  if port == "" {
-    port = "564"
-  }
+func (d *Driver) mountVolume(v *Volume) error {
+	port := v.Port
+	if port == "" {
+		port = "564"
+	}
 	cmd := exec.Command("mount", "-t", "9p", v.Host, "-o", fmt.Sprintf("trans=tcp,port=%s", port), v.Mountpoint)
 	logrus.Debug(cmd.Args)
 	return cmd.Run()
 }
 
-func (d *driver) unmountVolume(target string) error {
+func (d *Driver) unmountVolume(target string) error {
 	cmd := fmt.Sprintf("umount %s", target)
 	logrus.Debug(cmd)
 	return exec.Command("sh", "-c", cmd).Run()
 }
 
-func responseError(err string) volume.Response {
+func responseError(err string) error {
 	logrus.Error(err)
-	return volume.Response{Err: err}
+	return errors.New(err)
 }
 
 func main() {
@@ -260,6 +258,6 @@ func main() {
 		log.Fatal(err)
 	}
 	h := volume.NewHandler(d)
-	logrus.Infof("listening on %s", socketAddress)
-	logrus.Error(h.ServeUnix(socketAddress, 0))
+	logrus.Infof("listening ...")
+	logrus.Error(h.ServeUnix("9p", 0))
 }
