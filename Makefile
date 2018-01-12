@@ -13,7 +13,7 @@ rootfs:
 	@echo "### create rootfs directory in ./plugin/rootfs"
 	@mkdir -p ./plugin/rootfs
 	@docker create --name tmp ${PLUGIN_NAME}:rootfs
-	@docker export tmp | tar -x -C ./plugin/rootfs
+	@docker export tmp | tar -x -C ./plugin/rootfs --exclude dev/null
 	@echo "### copy config.json to ./plugin/"
 	@cp config.json ./plugin/
 	@docker rm -vf tmp
